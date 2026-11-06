@@ -5,24 +5,72 @@ import { useState, useRef, useEffect } from "react";
 // ============================================================
 const ENV_KEY = import.meta.env.VITE_GEMINI_API_KEY || ""; // opcional, solo para uso local (.env.local)
 const KEY_STORAGE = "gemini_api_key"; // la clave del usuario se guarda solo en su navegador
+const MAX_IMAGES = 4;
+const MAX_SIDE = 1800; // px: se reduce la imagen para que viaje liviana y se lea bien
+const ALLOWED_MIMES = ["image/png", "image/jpeg", "image/webp", "image/heic", "image/heif"];
 const MODEL = "gemini-2.5-flash"; // gemini-1.5-flash ya fue retirado por Google; si quieres, cámbialo aquí
 const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
 
-const PROMPT = `Eres un tutor paciente. Analiza la imagen, que contiene un problema o una tarea, y responde en español con una explicación detallada paso a paso.
+const PROMPT = `Eres un tutor paciente. Analiza las imágenes adjuntas, que contienen un problema o una tarea (pueden ser partes del mismo problema o problemas distintos), y responde en español con una explicación detallada paso a paso. Si son varios problemas, resuélvelos uno por uno indicando de qué imagen viene cada uno.
 Formato: empieza con una línea "## Qué se pide", luego "## Paso a paso" con una lista numerada (cada paso explica qué haces y por qué), y termina con "## Respuesta final".
 Escribe las fórmulas en texto plano (por ejemplo: v = d / t, x^2), sin LaTeX ni símbolos $.
-Si la imagen no se entiende o no contiene un problema, dilo con claridad.`;
+Si alguna imagen no se entiende o no contiene un problema, dilo con claridad.`;
 
 // ============================================================
 // UTILIDADES
 // ============================================================
-const fileToBase64 = (file) =>
+const blobToBase64 = (blob) =>
   new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result).split(",")[1]);
     reader.onerror = () => reject(new Error("No se pudo leer la imagen."));
-    reader.readAsDataURL(file);
+    reader.readAsDataURL(blob);
   });
+
+const guessMime = (file) => {
+  if (ALLOWED_MIMES.includes(file.type)) return file.type;
+  const ext = file.name.split(".").pop().toLowerCase();
+  return { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp", heic: "image/heic", heif: "image/heif" }[ext] || null;
+};
+
+// Reduce y convierte a JPG en el navegador. Si el navegador no puede abrir el formato
+// (por ejemplo HEIC en Chrome), envía el archivo original si pesa poco.
+async function prepareImage(file) {
+  try {
+    const bitmap = await createImageBitmap(file);
+    const scale = Math.min(1, MAX_SIDE / Math.max(bitmap.width, bitmap.height));
+    const w = Math.max(1, Math.round(bitmap.width * scale));
+    const h = Math.max(1, Math.round(bitmap.height * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(bitmap, 0, 0, w, h);
+    bitmap.close?.();
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.88));
+    if (!blob) throw new Error("canvas");
+    return { mime: "image/jpeg", data: await blobToBase64(blob) };
+  } catch {
+    const mime = guessMime(file);
+    if (!mime || file.size > 6 * 1024 * 1024) {
+      throw new Error(`No se pudo leer "${file.name}". Prueba con una captura o una foto en JPG o PNG.`);
+    }
+    return { mime, data: await blobToBase64(file) };
+  }
+}
+
+// Traduce los errores más comunes de la API
+const friendlyError = (status, message = "") => {
+  if (status === 400 && /api key/i.test(message)) return "La API key no es válida. Revísala y vuelve a guardarla.";
+  if (status === 403) return "La API key no tiene permiso para usar este modelo o fue restringida. " + message;
+  if (status === 404) return "El modelo no está disponible. Cambia la constante MODEL en src/App.jsx. " + message;
+  if (status === 413) return "Las imágenes pesan demasiado. Prueba con menos imágenes o más pequeñas.";
+  if (status === 429) return "Superaste el límite gratuito de Gemini. Espera un minuto e inténtalo de nuevo.";
+  if (status >= 500) return "Gemini tuvo un problema temporal. Inténtalo de nuevo en un momento.";
+  return message || `Error ${status} de la API.`;
+};
 
 // Quita el formato Markdown para que la voz no lea los símbolos
 const cleanForSpeech = (text) =>
@@ -129,8 +177,7 @@ function Markdown({ text }) {
 // COMPONENTE PRINCIPAL
 // ============================================================
 export default function App() {
-  const [file, setFile] = useState(null);
-  const [preview, setPreview] = useState(null);
+  const [images, setImages] = useState([]); // [{ id, file, url }]
   const [solution, setSolution] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -148,8 +195,10 @@ export default function App() {
   const inputRef = useRef(null);
   const speechSupported = typeof window !== "undefined" && "speechSynthesis" in window;
 
-  // Libera la URL de la vista previa y corta el audio al salir
-  useEffect(() => () => preview && URL.revokeObjectURL(preview), [preview]);
+  // Libera las vistas previas y corta el audio al salir
+  const imagesRef = useRef(images);
+  imagesRef.current = images;
+  useEffect(() => () => imagesRef.current.forEach((im) => URL.revokeObjectURL(im.url)), []);
   useEffect(() => () => speechSupported && window.speechSynthesis.cancel(), [speechSupported]);
 
   const saveKey = () => {
@@ -176,27 +225,45 @@ export default function App() {
     setEditingKey(false);
   };
 
-  const handleFile = (f) => {
-    if (!f) return;
-    if (!f.type.startsWith("image/")) {
-      setError("El archivo debe ser una imagen (JPG, PNG, WEBP).");
+  const addFiles = (fileList) => {
+    const incoming = Array.from(fileList || []).filter((f) => f.type.startsWith("image/") || guessMime(f));
+    if (!incoming.length) {
+      setError("Elige imágenes (JPG, PNG, WEBP o HEIC).");
       return;
     }
     stopSpeaking();
-    setError("");
+    const room = MAX_IMAGES - images.length;
+    const accepted = incoming.slice(0, Math.max(room, 0));
+    setError(
+      incoming.length > accepted.length
+        ? `Puedes subir hasta ${MAX_IMAGES} imágenes a la vez.`
+        : ""
+    );
+    if (!accepted.length) return;
     setSolution("");
-    setFile(f);
-    setPreview(URL.createObjectURL(f));
+    setImages((prev) => [
+      ...prev,
+      ...accepted.map((file) => ({ id: `${file.name}-${file.size}-${Math.random().toString(36).slice(2, 8)}`, file, url: URL.createObjectURL(file) })),
+    ]);
+  };
+
+  const removeImage = (id) => {
+    setImages((prev) => {
+      const gone = prev.find((im) => im.id === id);
+      if (gone) URL.revokeObjectURL(gone.url);
+      return prev.filter((im) => im.id !== id);
+    });
+    setError("");
   };
 
   const onDrop = (e) => {
     e.preventDefault();
     setDragging(false);
-    handleFile(e.dataTransfer.files?.[0]);
+    addFiles(e.dataTransfer.files);
   };
 
   const solve = async () => {
-    if (!file || loading) return;
+    if (!images.length || loading) return;
     if (!apiKey) {
       setError("Falta tu API key de Gemini: pégala en el campo de arriba y pulsa Guardar clave.");
       return;
@@ -206,24 +273,28 @@ export default function App() {
     setError("");
     setSolution("");
     try {
-      const data64 = await fileToBase64(file);
+      const prepared = await Promise.all(images.map((im) => prepareImage(im.file)));
+      const parts = [{ text: PROMPT }];
+      prepared.forEach((img, i) => {
+        parts.push({ text: `Imagen ${i + 1} de ${prepared.length}:` });
+        parts.push({ inlineData: { mimeType: img.mime, data: img.data } });
+      });
       const res = await fetch(API_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [{ text: PROMPT }, { inline_data: { mime_type: file.type, data: data64 } }],
-            },
-          ],
-        }),
+        body: JSON.stringify({ contents: [{ role: "user", parts }] }),
       });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json?.error?.message || `Error ${res.status} de la API.`);
+      let json = null;
+      try {
+        json = await res.json();
+      } catch {
+        /* respuesta sin JSON */
+      }
+      if (!res.ok) throw new Error(friendlyError(res.status, json?.error?.message));
       const text = json?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("\n").trim();
       if (!text) {
-        const reason = json?.promptFeedback?.blockReason;
-        throw new Error(reason ? `La imagen fue bloqueada (${reason}).` : "La API no devolvió texto.");
+        const reason = json?.promptFeedback?.blockReason || json?.candidates?.[0]?.finishReason;
+        throw new Error(reason ? `Gemini no devolvió respuesta (${reason}). Prueba con otra imagen.` : "La API no devolvió texto.");
       }
       setSolution(text);
     } catch (err) {
@@ -329,9 +400,9 @@ export default function App() {
         <div
           role="button"
           tabIndex={0}
-          aria-label="Subir imagen del problema"
-          onClick={() => inputRef.current?.click()}
-          onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && inputRef.current?.click()}
+          aria-label="Subir imágenes del problema"
+          onClick={() => images.length < MAX_IMAGES && inputRef.current?.click()}
+          onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && images.length < MAX_IMAGES && inputRef.current?.click()}
           onDragOver={(e) => {
             e.preventDefault();
             setDragging(true);
@@ -342,43 +413,68 @@ export default function App() {
             ...styles.dropzone,
             borderColor: dragging ? "#2F5BEA" : "#9AA8C7",
             background: dragging ? "#EAF0FF" : "#FFFFFF",
+            cursor: images.length < MAX_IMAGES ? "pointer" : "default",
           }}
         >
           <input
             ref={inputRef}
             type="file"
-            accept="image/*"
+            accept="image/*,.heic,.heif"
+            multiple
             hidden
             onChange={(e) => {
-              handleFile(e.target.files?.[0]);
+              addFiles(e.target.files);
               e.target.value = "";
             }}
           />
-          {preview ? (
-            <img src={preview} alt="Vista previa del problema" style={styles.preview} />
+          {images.length ? (
+            <div style={styles.thumbGrid}>
+              {images.map((im, i) => (
+                <div key={im.id} style={styles.thumb}>
+                  <img src={im.url} alt={`Imagen ${i + 1}`} style={styles.thumbImg} />
+                  <button
+                    aria-label={`Quitar imagen ${i + 1}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      removeImage(im.id);
+                    }}
+                    style={styles.removeBtn}
+                  >
+                    ✕
+                  </button>
+                  <span style={styles.thumbName}>{im.file.name}</span>
+                </div>
+              ))}
+              {images.length < MAX_IMAGES && (
+                <div style={styles.addTile}>
+                  <span style={{ fontSize: 28, lineHeight: 1 }}>+</span>
+                  <span style={{ fontSize: 13 }}>Agregar</span>
+                </div>
+              )}
+            </div>
           ) : (
             <div style={{ textAlign: "center", color: "#4A5878" }}>
               <div style={{ fontSize: 36, lineHeight: 1 }}>🖼️</div>
               <p style={{ margin: "10px 0 2px", fontWeight: 600, color: "#1B2A41" }}>
-                Arrastra la imagen aquí
+                Arrastra hasta {MAX_IMAGES} imágenes aquí
               </p>
-              <p style={{ margin: 0, fontSize: 14 }}>o haz clic para elegir un archivo</p>
+              <p style={{ margin: 0, fontSize: 14 }}>o haz clic para elegir archivos</p>
             </div>
           )}
         </div>
-        {file && (
+        {images.length > 0 && (
           <p style={styles.fileName}>
-            {file.name} · haz clic en la imagen para cambiarla
+            {images.length} de {MAX_IMAGES} imágenes
           </p>
         )}
 
         <button
           onClick={solve}
-          disabled={!file || loading}
+          disabled={!images.length || loading}
           style={{
             ...styles.primaryBtn,
-            opacity: !file || loading ? 0.55 : 1,
-            cursor: !file || loading ? "not-allowed" : "pointer",
+            opacity: !images.length || loading ? 0.55 : 1,
+            cursor: !images.length || loading ? "not-allowed" : "pointer",
           }}
         >
           {loading ? (
@@ -489,7 +585,35 @@ const styles = {
     transition: "background 0.15s, border-color 0.15s",
     boxSizing: "border-box",
   },
-  preview: { maxWidth: "100%", maxHeight: 340, borderRadius: 8, objectFit: "contain" },
+  thumbGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(130px, 1fr))", gap: 12, width: "100%" },
+  thumb: { position: "relative", display: "flex", flexDirection: "column", gap: 4, minWidth: 0 },
+  thumbImg: { width: "100%", height: 120, objectFit: "cover", borderRadius: 8, border: "1px solid #D5DEEE", background: "#EEF2FA" },
+  thumbName: { fontSize: 12, color: "#4A5878", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  removeBtn: {
+    position: "absolute",
+    top: 6,
+    right: 6,
+    width: 26,
+    height: 26,
+    border: "none",
+    borderRadius: "50%",
+    background: "rgba(27,42,65,0.85)",
+    color: "#fff",
+    fontSize: 13,
+    cursor: "pointer",
+    lineHeight: 1,
+  },
+  addTile: {
+    height: 120,
+    border: "2px dashed #9AA8C7",
+    borderRadius: 8,
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 4,
+    color: "#4A5878",
+  },
   fileName: { margin: "8px 2px 0", fontSize: 13, color: "#4A5878", wordBreak: "break-all" },
   primaryBtn: {
     marginTop: 16,
