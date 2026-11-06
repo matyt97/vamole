@@ -8,7 +8,7 @@ const KEY_STORAGE = "gemini_api_key"; // la clave del usuario se guarda solo en 
 const MAX_IMAGES = 4;
 const MAX_SIDE = 1800; // px: se reduce la imagen para que viaje liviana y se lea bien
 const ALLOWED_MIMES = ["image/png", "image/jpeg", "image/webp", "image/heic", "image/heif"];
-const MODEL = "gemini-2.5-flash"; // gemini-1.5-flash ya fue retirado por Google; si quieres, cámbialo aquí
+const MODEL = "gemini-3.8-flash"; // gemini-1.5-flash ya fue retirado por Google; si quieres, cámbialo aquí
 const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
 
 const PROMPT = `Eres un tutor paciente. Analiza las imágenes adjuntas, que contienen un problema o una tarea (pueden ser partes del mismo problema o problemas distintos), y responde en español con una explicación detallada paso a paso. Si son varios problemas, resuélvelos uno por uno indicando de qué imagen viene cada uno.
