@@ -8,9 +8,17 @@ const KEY_STORAGE = "gemini_api_key"; // la clave del usuario se guarda solo en 
 const MAX_IMAGES = 4;
 const MAX_SIDE = 1800; // px: se reduce la imagen para que viaje liviana y se lea bien
 const ALLOWED_MIMES = ["image/png", "image/jpeg", "image/webp", "image/heic", "image/heif"];
-const MODEL = "gemini-3.8-flash"; // si Google lo retira, cambia el nombre aquí
-const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:streamGenerateContent?alt=sse`; // el texto llega por partes
-const TIMEOUT_MS = 150000; // si pasa de 2,5 min, se corta con un aviso
+// Modelos disponibles en la lista. "thinking" = nivel de razonamiento (menos = más rápido)
+const MODELS = [
+  { id: "gemini-3.5-flash-lite", label: "Rápido (3.5 Flash-Lite)", thinking: null },
+  { id: "gemini-3.6-flash", label: "Equilibrado (3.6 Flash)", thinking: "low" },
+  { id: "gemini-3.8-flash", label: "Más preciso (3.8 Flash)", thinking: "low" },
+];
+const DEFAULT_MODEL = "gemini-3.6-flash";
+const MODEL_STORAGE = "gemini_model";
+const apiUrl = (model) =>
+  `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`; // el texto llega por partes
+const TIMEOUT_MS = 90000; // si pasa de 90 s, se corta con un aviso
 
 const PROMPT = `Eres un tutor paciente. Analiza las imágenes adjuntas, que contienen un problema o una tarea (pueden ser partes del mismo problema o problemas distintos), y responde en español con una explicación detallada paso a paso. Si son varios problemas, resuélvelos uno por uno indicando de qué imagen viene cada uno.
 Formato: empieza con una línea "## Qué se pide", luego "## Paso a paso" con una lista numerada (cada paso explica qué haces y por qué), y termina con "## Respuesta final".
@@ -66,7 +74,7 @@ async function prepareImage(file) {
 const friendlyError = (status, message = "") => {
   if (status === 400 && /api key/i.test(message)) return "La API key no es válida. Revísala y vuelve a guardarla.";
   if (status === 403) return "La API key no tiene permiso para usar este modelo o fue restringida. " + message;
-  if (status === 404) return "El modelo no está disponible. Cambia la constante MODEL en src/App.jsx. " + message;
+  if (status === 404) return "El modelo no está disponible para tu cuenta. Elige otro en la lista Modelo. " + message;
   if (status === 413) return "Las imágenes pesan demasiado. Prueba con menos imágenes o más pequeñas.";
   if (status === 429) return "Superaste el límite gratuito de Gemini. Espera un minuto e inténtalo de nuevo.";
   if (status >= 500) return "Gemini tuvo un problema temporal. Inténtalo de nuevo en un momento.";
@@ -182,6 +190,15 @@ export default function App() {
   const [solution, setSolution] = useState("");
   const [loading, setLoading] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+  const [stage, setStage] = useState("");
+  const [model, setModel] = useState(() => {
+    try {
+      const saved = localStorage.getItem(MODEL_STORAGE);
+      return MODELS.some((m) => m.id === saved) ? saved : DEFAULT_MODEL;
+    } catch {
+      return DEFAULT_MODEL;
+    }
+  });
   const abortRef = useRef(null);
   const [error, setError] = useState("");
   const [dragging, setDragging] = useState(false);
@@ -275,6 +292,15 @@ export default function App() {
 
   const cancelSolve = () => abortRef.current?.abort();
 
+  const changeModel = (id) => {
+    setModel(id);
+    try {
+      localStorage.setItem(MODEL_STORAGE, id);
+    } catch {
+      /* sin almacenamiento: vale solo en esta sesión */
+    }
+  };
+
   const solve = async () => {
     if (!images.length || loading) return;
     if (!apiKey) {
@@ -295,6 +321,7 @@ export default function App() {
     }, TIMEOUT_MS);
 
     try {
+      setStage("Preparando las imágenes…");
       const prepared = await Promise.all(images.map((im) => prepareImage(im.file)));
       const parts = [{ text: PROMPT }];
       prepared.forEach((img, i) => {
@@ -302,18 +329,19 @@ export default function App() {
         parts.push({ inlineData: { mimeType: img.mime, data: img.data } });
       });
 
-      // thinkingLevel "low" hace que Gemini empiece a responder mucho antes
+      const level = MODELS.find((m) => m.id === model)?.thinking;
       const send = (withThinking) =>
-        fetch(API_URL, {
+        fetch(apiUrl(model), {
           method: "POST",
           headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
           signal: controller.signal,
           body: JSON.stringify({
             contents: [{ role: "user", parts }],
-            ...(withThinking ? { generationConfig: { thinkingConfig: { thinkingLevel: "low" } } } : {}),
+            ...(withThinking && level ? { generationConfig: { thinkingConfig: { thinkingLevel: level } } } : {}),
           }),
         });
 
+      setStage("Enviando a Gemini…");
       let res = await send(true);
       if (res.status === 400) {
         const detail = await res.clone().text();
@@ -329,6 +357,7 @@ export default function App() {
         throw new Error(friendlyError(res.status, json?.error?.message));
       }
 
+      setStage("Gemini está pensando…");
       // Lee la respuesta a medida que llega y la muestra al instante
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -367,13 +396,14 @@ export default function App() {
         throw new Error(lastReason ? `Gemini no devolvió respuesta (${lastReason}). Prueba con otra imagen.` : "La API no devolvió texto.");
       }
     } catch (err) {
-      if (timedOut) setError("Gemini tardó más de 2 minutos y se canceló. Prueba con menos imágenes o inténtalo de nuevo.");
+      if (timedOut) setError("Gemini no respondió en 90 segundos y se canceló. Prueba con el modelo \"Rápido\" de la lista o con menos imágenes.");
       else if (controller.signal.aborted) setError("Cancelado.");
       else setError(err.message || "Ocurrió un error inesperado.");
     } finally {
       clearTimeout(timer);
       abortRef.current = null;
       setLoading(false);
+      setStage("");
     }
   };
 
@@ -541,6 +571,25 @@ export default function App() {
           </p>
         )}
 
+        <div style={styles.modelRow}>
+          <label htmlFor="model" style={{ fontSize: 14, fontWeight: 600 }}>
+            Modelo
+          </label>
+          <select
+            id="model"
+            value={model}
+            onChange={(e) => changeModel(e.target.value)}
+            disabled={loading}
+            style={styles.select}
+          >
+            {MODELS.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
         <button
           onClick={solve}
           disabled={!images.length || loading}
@@ -562,9 +611,7 @@ export default function App() {
         {loading && (
           <div style={styles.waitRow}>
             <span style={{ fontSize: 13.5, color: "#4A5878" }}>
-              {solution
-                ? "Escribiendo la solución…"
-                : "Gemini está leyendo las imágenes. Con varias fotos puede tardar hasta 30 segundos."}
+              {solution ? "Escribiendo la solución…" : stage}
             </span>
             <button onClick={cancelSolve} style={styles.linkBtn}>
               Cancelar
@@ -637,6 +684,8 @@ const styles = {
     fontSize: 15,
     minWidth: 0,
   },
+  modelRow: { marginTop: 16, display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10 },
+  select: { flex: "1 1 220px", padding: "9px 10px", border: "1.5px solid #9AA8C7", borderRadius: 8, fontSize: 15, background: "#fff", color: "#1B2A41" },
   waitRow: { marginTop: 10, display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: 10 },
   keyBtn: {
     padding: "10px 16px",
