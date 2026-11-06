@@ -8,8 +8,9 @@ const KEY_STORAGE = "gemini_api_key"; // la clave del usuario se guarda solo en 
 const MAX_IMAGES = 4;
 const MAX_SIDE = 1800; // px: se reduce la imagen para que viaje liviana y se lea bien
 const ALLOWED_MIMES = ["image/png", "image/jpeg", "image/webp", "image/heic", "image/heif"];
-const MODEL = "gemini-3.8-flash"; // gemini-1.5-flash ya fue retirado por Google; si quieres, cámbialo aquí
-const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
+const MODEL = "gemini-3.8-flash"; // si Google lo retira, cambia el nombre aquí
+const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:streamGenerateContent?alt=sse`; // el texto llega por partes
+const TIMEOUT_MS = 150000; // si pasa de 2,5 min, se corta con un aviso
 
 const PROMPT = `Eres un tutor paciente. Analiza las imágenes adjuntas, que contienen un problema o una tarea (pueden ser partes del mismo problema o problemas distintos), y responde en español con una explicación detallada paso a paso. Si son varios problemas, resuélvelos uno por uno indicando de qué imagen viene cada uno.
 Formato: empieza con una línea "## Qué se pide", luego "## Paso a paso" con una lista numerada (cada paso explica qué haces y por qué), y termina con "## Respuesta final".
@@ -180,6 +181,8 @@ export default function App() {
   const [images, setImages] = useState([]); // [{ id, file, url }]
   const [solution, setSolution] = useState("");
   const [loading, setLoading] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const abortRef = useRef(null);
   const [error, setError] = useState("");
   const [dragging, setDragging] = useState(false);
   const [speaking, setSpeaking] = useState(false);
@@ -194,6 +197,14 @@ export default function App() {
   const [editingKey, setEditingKey] = useState(false);
   const inputRef = useRef(null);
   const speechSupported = typeof window !== "undefined" && "speechSynthesis" in window;
+
+  // Cuenta los segundos mientras Gemini trabaja
+  useEffect(() => {
+    if (!loading) return undefined;
+    setElapsed(0);
+    const t = setInterval(() => setElapsed((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, [loading]);
 
   // Libera las vistas previas y corta el audio al salir
   const imagesRef = useRef(images);
@@ -262,6 +273,8 @@ export default function App() {
     addFiles(e.dataTransfer.files);
   };
 
+  const cancelSolve = () => abortRef.current?.abort();
+
   const solve = async () => {
     if (!images.length || loading) return;
     if (!apiKey) {
@@ -272,6 +285,15 @@ export default function App() {
     setLoading(true);
     setError("");
     setSolution("");
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, TIMEOUT_MS);
+
     try {
       const prepared = await Promise.all(images.map((im) => prepareImage(im.file)));
       const parts = [{ text: PROMPT }];
@@ -279,27 +301,78 @@ export default function App() {
         parts.push({ text: `Imagen ${i + 1} de ${prepared.length}:` });
         parts.push({ inlineData: { mimeType: img.mime, data: img.data } });
       });
-      const res = await fetch(API_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-        body: JSON.stringify({ contents: [{ role: "user", parts }] }),
-      });
-      let json = null;
-      try {
-        json = await res.json();
-      } catch {
-        /* respuesta sin JSON */
+
+      // thinkingLevel "low" hace que Gemini empiece a responder mucho antes
+      const send = (withThinking) =>
+        fetch(API_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+          signal: controller.signal,
+          body: JSON.stringify({
+            contents: [{ role: "user", parts }],
+            ...(withThinking ? { generationConfig: { thinkingConfig: { thinkingLevel: "low" } } } : {}),
+          }),
+        });
+
+      let res = await send(true);
+      if (res.status === 400) {
+        const detail = await res.clone().text();
+        if (/thinking/i.test(detail)) res = await send(false); // el modelo no acepta ese ajuste
       }
-      if (!res.ok) throw new Error(friendlyError(res.status, json?.error?.message));
-      const text = json?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("\n").trim();
-      if (!text) {
-        const reason = json?.promptFeedback?.blockReason || json?.candidates?.[0]?.finishReason;
-        throw new Error(reason ? `Gemini no devolvió respuesta (${reason}). Prueba con otra imagen.` : "La API no devolvió texto.");
+      if (!res.ok) {
+        let json = null;
+        try {
+          json = await res.json();
+        } catch {
+          /* respuesta sin JSON */
+        }
+        throw new Error(friendlyError(res.status, json?.error?.message));
       }
-      setSolution(text);
+
+      // Lee la respuesta a medida que llega y la muestra al instante
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let full = "";
+      let lastReason = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+          const payload = line.slice(5).trim();
+          if (!payload || payload === "[DONE]") continue;
+          let chunk = null;
+          try {
+            chunk = JSON.parse(payload);
+          } catch {
+            continue;
+          }
+          if (chunk.error) throw new Error(friendlyError(chunk.error.code || 500, chunk.error.message));
+          lastReason = chunk.promptFeedback?.blockReason || chunk.candidates?.[0]?.finishReason || lastReason;
+          const piece = chunk.candidates?.[0]?.content?.parts
+            ?.filter((part) => !part.thought)
+            .map((part) => part.text || "")
+            .join("");
+          if (piece) {
+            full += piece;
+            setSolution(full);
+          }
+        }
+      }
+      if (!full.trim()) {
+        throw new Error(lastReason ? `Gemini no devolvió respuesta (${lastReason}). Prueba con otra imagen.` : "La API no devolvió texto.");
+      }
     } catch (err) {
-      setError(err.message || "Ocurrió un error inesperado.");
+      if (timedOut) setError("Gemini tardó más de 2 minutos y se canceló. Prueba con menos imágenes o inténtalo de nuevo.");
+      else if (controller.signal.aborted) setError("Cancelado.");
+      else setError(err.message || "Ocurrió un error inesperado.");
     } finally {
+      clearTimeout(timer);
+      abortRef.current = null;
       setLoading(false);
     }
   };
@@ -479,12 +552,25 @@ export default function App() {
         >
           {loading ? (
             <>
-              <span className="spinner" style={styles.spinner} /> Resolviendo…
+              <span className="spinner" style={styles.spinner} /> Resolviendo… {elapsed} s
             </>
           ) : (
             "Resolver Problema"
           )}
         </button>
+
+        {loading && (
+          <div style={styles.waitRow}>
+            <span style={{ fontSize: 13.5, color: "#4A5878" }}>
+              {solution
+                ? "Escribiendo la solución…"
+                : "Gemini está leyendo las imágenes. Con varias fotos puede tardar hasta 30 segundos."}
+            </span>
+            <button onClick={cancelSolve} style={styles.linkBtn}>
+              Cancelar
+            </button>
+          </div>
+        )}
 
         {error && (
           <div role="alert" style={styles.error}>
@@ -498,8 +584,8 @@ export default function App() {
             <div style={styles.toolbar}>
               <button
                 onClick={speakSolution}
-                disabled={!speechSupported || speaking}
-                style={{ ...styles.speakBtn, opacity: !speechSupported || speaking ? 0.55 : 1 }}
+                disabled={!speechSupported || speaking || loading}
+                style={{ ...styles.speakBtn, opacity: !speechSupported || speaking || loading ? 0.55 : 1 }}
               >
                 {speaking ? "Dictando…" : "Dictar Solución (Lento)"}
               </button>
@@ -551,6 +637,7 @@ const styles = {
     fontSize: 15,
     minWidth: 0,
   },
+  waitRow: { marginTop: 10, display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: 10 },
   keyBtn: {
     padding: "10px 16px",
     border: "none",
